@@ -1,0 +1,201 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  WebSocket API health monitoring and DNS failover.
+  Deploys a canary AWS Lambda function that probes the WebSocket endpoint every minute
+  and publishes a custom Amazon CloudWatch metric. An Amazon Route 53 health check triggers
+  failover when the canary reports unhealthy or stops publishing.
+  Deploy in the primary Region only.
+
+Parameters:
+  WebSocketUrl:
+    Type: String
+    Description: 'Regional WebSocket endpoint to probe (e.g., wss://{api-id}.execute-api.us-east-1.amazonaws.com/prod)'
+
+  EvaluationPeriods:
+    Type: Number
+    Default: 2
+    Description: 'Consecutive unhealthy datapoints before failover triggers'
+
+Resources:
+  # --- Canary Lambda ---
+  CanaryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'websocket-canary-${AWS::Region}'
+      Description: 'Probes WebSocket endpoint and publishes health metric'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt CanaryRole.Arn
+      Environment:
+        Variables:
+          WEBSOCKET_URL: !Ref WebSocketUrl
+      Code:
+        ZipFile: |
+          import json, os, logging, socket, ssl, base64, struct, boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          WEBSOCKET_URL = os.environ['WEBSOCKET_URL']
+          cloudwatch = boto3.client('cloudwatch')
+
+          API_ID = WEBSOCKET_URL.split('//')[1].split('.')[0]
+
+          def publish_metric(healthy):
+              cloudwatch.put_metric_data(
+                  Namespace='App/WebSocketHealth',
+                  MetricData=[{'MetricName': 'CanaryStatus', 'Dimensions': [{'Name': 'ApiId', 'Value': API_ID}], 'Value': int(healthy), 'Unit': 'None'}]
+              )
+
+          def build_ws_frame(payload_bytes):
+              mask = os.urandom(4)
+              header = bytearray([0x81])
+              length = len(payload_bytes)
+              if length < 126:
+                  header.append(0x80 | length)
+              else:
+                  header.append(0x80 | 126)
+                  header.extend(struct.pack('>H', length))
+              header.extend(mask)
+              masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload_bytes))
+              return bytes(header) + masked
+
+          def ws_connect(host, path):
+              raw = socket.create_connection((host, 443), timeout=5)
+              sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+              key = base64.b64encode(os.urandom(16)).decode()
+              sock.sendall(
+                  f'GET {path} HTTP/1.1\r\n'
+                  f'Host: {host}\r\n'
+                  f'Upgrade: websocket\r\n'
+                  f'Connection: Upgrade\r\n'
+                  f'Sec-WebSocket-Key: {key}\r\n'
+                  f'Sec-WebSocket-Version: 13\r\n'
+                  f'\r\n'.encode()
+              )
+              response = b''
+              while b'\r\n\r\n' not in response:
+                  response += sock.recv(4096)
+              if b'101' not in response.split(b'\r\n')[0]:
+                  sock.close()
+                  raise ConnectionError(f'Handshake failed: {response.split(b"\\r\\n")[0].decode()}')
+              return sock
+
+          def ws_close(sock):
+              try:
+                  sock.sendall(bytearray([0x88, 0x80]) + os.urandom(4))
+                  sock.close()
+              except Exception:
+                  pass
+
+          def handler(event, context):
+              sock = None
+              try:
+                  host_path = WEBSOCKET_URL[len('wss://'):]
+                  host, path = host_path.split('/', 1) if '/' in host_path else (host_path, '')
+                  path = '/' + path
+                  sock = ws_connect(host, path)
+                  sock.sendall(build_ws_frame(json.dumps({'action': 'heartbeat'}).encode()))
+                  sock.settimeout(5)
+                  data = sock.recv(4096)
+                  healthy = b'pong' in data
+                  if not healthy:
+                      logger.warning(f'Unexpected response: {data[:100]}')
+                  publish_metric(healthy)
+                  return {'statusCode': 200 if healthy else 500}
+              except Exception as e:
+                  logger.error(f'Canary failed: {e}')
+                  publish_metric(False)
+                  return {'statusCode': 500}
+              finally:
+                  if sock:
+                      ws_close(sock)
+
+  # --- IAM Role ---
+  CanaryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  # --- EventBridge Schedule ---
+  CanarySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger WebSocket canary every minute'
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Id: CanaryTarget
+          Arn: !GetAtt CanaryFunction.Arn
+
+  CanaryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CanaryFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CanarySchedule.Arn
+
+  # --- CloudWatch Alarm ---
+  CanaryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'WebSocket-Canary-Unhealthy-${AWS::Region}'
+      AlarmDescription: 'WebSocket canary reports endpoint unhealthy or stopped publishing'
+      Namespace: App/WebSocketHealth
+      MetricName: CanaryStatus
+      Dimensions:
+        - Name: ApiId
+          Value: !Select [0, !Split ['.', !Select [0, !Split ['/', !Select [1, !Split ['://', !Ref WebSocketUrl]]]]]]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: !Ref EvaluationPeriods
+      DatapointsToAlarm: !Ref EvaluationPeriods
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  # --- Route 53 Health Check ---
+  CanaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: CLOUDWATCH_METRIC
+        AlarmIdentifier:
+          Name: !Ref CanaryAlarm
+          Region: !Ref AWS::Region
+        InsufficientDataHealthStatus: Unhealthy
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub 'websocket-canary-${AWS::Region}'
+
+Outputs:
+  HealthCheckId:
+    Description: 'Attach this to the PRIMARY Route 53 failover record'
+    Value: !Ref CanaryHealthCheck
+
+  CanaryFunctionArn:
+    Value: !GetAtt CanaryFunction.Arn
+
+  CanaryAlarmName:
+    Value: !Ref CanaryAlarm
